@@ -1,68 +1,54 @@
-# dataset_mtp.py
-import os
-import pickle
-import torch
+import pickle, numpy as np, torch
 from torch.utils.data import Dataset
-import numpy as np
 
-class MTPTrajDataset(Dataset):
+class MTPTrajSeqPathsDataset(Dataset):
     """
-    Generic dataset for multimodal trajectory prediction.
-    Loads from prebuilt pickle of instance pairs, with optional extra features.
-    Each item returns a dict with:
-      - past_xy   [Tp,2]
-      - future_xy [Tf,2]
-      - bev       [1,H,W]   (if available)
-      - can       [D]       (if available)
-      - mapfeat   [F]       (if available)
-    """
+    Loads:
+      - past_xy: [Tp,2]
+      - future_xy: [Tf,2]
+      - If present: bev_seq_paths -> loads [Tp,C,H,W]
+      - Else: builds toy BEV seq from past_xy (C=1)
 
-    def __init__(self, pairs_pkl, bev_dir=None, can_dir=None, mapfeat_dir=None, device="cpu"):
-        """
-        pairs_pkl : str  path to pickle with [{"past_xy":..., "future_xy":..., "sample_token":..., "instance_token":...}]
-        bev_dir   : str  folder with BEV rasters saved as .npy (optional)
-        can_dir   : str  folder with CAN signals per sample_token (optional)
-        mapfeat_dir: str folder with map features per sample_token (optional)
-        """
+    Notes:
+      - Expects all saved BEV frames to have identical shape [C,H,W].
+      - If your exporter later writes multi-channel BEV per t, this loader still works.
+    """
+    def __init__(self, pairs_pkl, H=128, W=128, extent_m=30.0):
         self.items = pickle.load(open(pairs_pkl, "rb"))
-        self.bev_dir = bev_dir
-        self.can_dir = can_dir
-        self.mapfeat_dir = mapfeat_dir
-        self.device = device
+        self.H, self.W = H, W
+        self.s = (H - 1) / (2 * extent_m)
 
     def __len__(self):
         return len(self.items)
 
+    def _px(self, xy):
+        x, y = xy[..., 0], xy[..., 1]
+        u = (self.W / 2 + x * self.s).round().astype(int)
+        v = (self.H / 2 - y * self.s).round().astype(int)
+        m = (u >= 0) & (u < self.W) & (v >= 0) & (v < self.H)
+        return u[m], v[m]
+
     def __getitem__(self, i):
         it = self.items[i]
+        past = torch.tensor(it["past_xy"], dtype=torch.float32)   # [Tp,2]
+        fut  = torch.tensor(it["future_xy"], dtype=torch.float32) # [Tf,2]
+        Tp = past.shape[0]
 
-        past_xy   = torch.from_numpy(it["past_xy"]).float()     # [Tp,2]
-        future_xy = torch.from_numpy(it["future_xy"]).float()   # [Tf,2]
+        # Preferred path: load stored sequential BEVs
+        if "bev_seq_paths" in it:
+            frames = []
+            for p in it["bev_seq_paths"]:
+                arr = np.load(p)              # [C,H,W]
+                frames.append(torch.from_numpy(arr).float())
+            bev_seq = torch.stack(frames, dim=0)  # [Tp,C,H,W]
+            return {"past_xy": past, "future_xy": fut, "bev_seq": bev_seq}
 
-        sample_token = it.get("sample_token", None)
-
-        # load extras if directories provided
-        bev = None
-        if self.bev_dir and sample_token:
-            bev_path = os.path.join(self.bev_dir, f"{sample_token}.npy")
-            bev = torch.from_numpy(np.load(bev_path)).float()   # [1,H,W]
-
-        can = None
-        if self.can_dir and sample_token:
-            can_path = os.path.join(self.can_dir, f"{sample_token}.npy")
-            can = torch.from_numpy(np.load(can_path)).float()   # [D]
-
-        mapfeat = None
-        if self.mapfeat_dir and sample_token:
-            mf_path = os.path.join(self.mapfeat_dir, f"{sample_token}.npy")
-            mapfeat = torch.from_numpy(np.load(mf_path)).float()   # [F]
-
-        return {
-            "past_xy": past_xy,
-            "future_xy": future_xy,
-            "bev": bev,
-            "can": can,
-            "mapfeat": mapfeat,
-            "sample_token": sample_token,
-            "instance_token": it.get("instance_token", None)
-        }
+        # Fallback: toy BEV sequence built from past_xy (C=1)
+        bev_seq = []
+        for t in range(Tp):
+            img = np.zeros((self.H, self.W), np.float32)
+            u, v = self._px(past[t:t+1].numpy())
+            if u.size > 0: img[v, u] = 1.0
+            bev_seq.append(torch.from_numpy(img[None, ...]))  # [1,H,W]
+        bev_seq = torch.stack(bev_seq, dim=0)                 # [Tp,1,H,W]
+        return {"past_xy": past, "future_xy": fut, "bev_seq": bev_seq}
